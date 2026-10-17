@@ -1,0 +1,23 @@
+# Secrets (never commit)
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+serviceAccountKey.json
+
+# Node
+node_modules/
+
+# Rust / Cloudflare Worker build output
+target/
+build/
+.wrangler/
+
+# Editors / OS
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
