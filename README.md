@@ -62,7 +62,8 @@ The API returns the website's gamemode names: `nethertite` (database `nethop`) a
 The site lives in `Website/` (also a Cloudflare Worker, named `primetiers`). It calls this API from the browser, so every origin that loads the site must be listed in `ALLOWED_ORIGINS` in `wrangler.toml`. Current origins: `https://primetiers.net`, the site's `workers.dev` address, and `http://localhost:5173` for Vite dev.
 
 ### Caching
-- Every GET response is stored at the Cloudflare edge for **60 seconds**, keyed by full URL. Repeat requests return `x-cache: HIT` and don't call Supabase.
+- Every GET response is cached for **5 minutes** (`CACHE_TTL_SECONDS` in `src/lib.rs`), keyed by full URL. Repeat requests return `x-cache: HIT` and don't call Supabase. Browsers also keep the response for 5 minutes (`max-age=300`), so a visitor's repeat loads don't hit the API at all.
+- Cache is per Cloudflare data center. Visitors in the same region share one fetch every 5 minutes. Data can be up to 5 minutes old.
 - 200, 400, and 404 responses are cached. Upstream errors (502) are never cached.
 - CORS is allowed only for origins listed in `ALLOWED_ORIGINS` (`wrangler.toml`).
 

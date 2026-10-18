@@ -29,7 +29,9 @@ const GAMEMODES: &[&str] = &[
     "cart",
 ];
 
-const CACHE_CONTROL: &str = "public, max-age=15, s-maxage=60, stale-while-revalidate=300";
+/// Browser and edge cache window for successful GET responses (5 minutes).
+const CACHE_TTL_SECONDS: u32 = 300;
+const CACHE_CONTROL: &str = "public, max-age=300, s-maxage=300";
 
 #[derive(Deserialize)]
 struct PlayerTier {
@@ -563,7 +565,7 @@ async fn get_recent(req: Request, ctx: RouteContext<()>) -> Result<Response> {
 
 /// Edge cache TTL for successful and client-error GET responses. Upstream
 /// (Supabase) errors are never cached.
-const EDGE_TTL_SECONDS: u32 = 60;
+const EDGE_TTL_SECONDS: u32 = CACHE_TTL_SECONDS;
 
 fn set_cors(headers: &Headers, origin: Option<&str>) -> Result<()> {
     headers.delete("access-control-allow-origin")?;
@@ -641,7 +643,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         let mut copy = resp.cloned()?;
         copy.headers_mut().set(
             "cache-control",
-            &format!("public, max-age=15, s-maxage={EDGE_TTL_SECONDS}"),
+            &format!("public, max-age={EDGE_TTL_SECONDS}, s-maxage={EDGE_TTL_SECONDS}"),
         )?;
         if let Err(e) = cache.put(key.as_str(), copy).await {
             console_error!("cache put failed: {e}");
