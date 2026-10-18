@@ -13,10 +13,20 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use worker::*;
 
 const GAMEMODES: &[&str] = &[
-    "crystal", "axe", "sword", "mace", "macespear", "nethop", "pot", "smp", "uhc", "cart",
+    "crystal",
+    "axe",
+    "sword",
+    "mace",
+    "macespear",
+    "nethop",
+    "pot",
+    "smp",
+    "uhc",
+    "cart",
 ];
 
 const CACHE_CONTROL: &str = "public, max-age=15, s-maxage=60, stale-while-revalidate=300";
@@ -64,7 +74,11 @@ struct ApiError<'a> {
     error: &'a str,
 }
 
-fn with_common_headers(mut resp: Response, cache: bool, origin_ok: Option<&str>) -> Result<Response> {
+fn with_common_headers(
+    mut resp: Response,
+    cache: bool,
+    origin_ok: Option<&str>,
+) -> Result<Response> {
     let headers = resp.headers_mut();
     headers.set("content-type", "application/json; charset=utf-8")?;
     headers.set("x-content-type-options", "nosniff")?;
@@ -93,7 +107,10 @@ fn json_err(status: u16, msg: &str, origin: Option<&str>) -> Result<Response> {
 /// Returns the request's Origin if it's on the allow list.
 fn allowed_origin(req: &Request, env: &Env) -> Option<String> {
     let origin = req.headers().get("origin").ok().flatten()?;
-    let list = env.var("ALLOWED_ORIGINS").map(|v| v.to_string()).unwrap_or_default();
+    let list = env
+        .var("ALLOWED_ORIGINS")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
     list.split(',')
         .map(|s| s.trim())
         .any(|s| !s.is_empty() && s == origin)
@@ -105,7 +122,8 @@ fn allowed_origin(req: &Request, env: &Env) -> Option<String> {
 fn valid_username(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
 fn clamp_limit(req: &Request, default: u32, max: u32) -> u32 {
@@ -179,6 +197,7 @@ async fn get_player(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let tiers: Vec<Value> = p
         .player_tiers
         .iter()
+        .filter(|t| is_active_gamemode(&t.gamemode))
         .map(|t| json!({ "gamemode": t.gamemode, "tier": t.tier, "updatedAt": t.updated_at }))
         .collect();
     json_ok(
@@ -193,10 +212,286 @@ async fn get_player(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     )
 }
 
+#[derive(Deserialize)]
+struct LbPlayer {
+    id: i64,
+    username: String,
+    region: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LbRow {
+    gamemode: String,
+    tier: String,
+    players: Option<LbPlayer>,
+}
+
+/// HT1 is the highest tier. Lower rank number = better.
+fn tier_rank(tier: &str) -> Option<u8> {
+    match tier.to_ascii_uppercase().as_str() {
+        "HT1" => Some(1),
+        "LT1" => Some(2),
+        "HT2" => Some(3),
+        "LT2" => Some(4),
+        "HT3" => Some(5),
+        "LT3" => Some(6),
+        "HT4" => Some(7),
+        "LT4" => Some(8),
+        "HT5" => Some(9),
+        "LT5" => Some(10),
+        _ => None,
+    }
+}
+
+/// GET /api/leaderboard[?gamemode=macespear]
+/// Every gamemode's ranking in one Supabase query, sorted HT1 first.
+/// Edge-cached like every other GET, so visitors share one upstream call per minute.
+async fn get_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let origin = allowed_origin(&req, &ctx.env);
+    let o = origin.as_deref();
+
+    let filter = req.url().ok().and_then(|u| {
+        u.query_pairs()
+            .find(|(k, _)| k == "gamemode")
+            .map(|(_, v)| v.to_lowercase())
+    });
+    if let Some(gm) = &filter {
+        if !GAMEMODES.contains(&gm.as_str()) {
+            return json_err(404, "unknown gamemode", o);
+        }
+    }
+
+    // PostgREST returns at most max_rows (default 1000). Fine until the tier table gets that big.
+    let rows: Vec<LbRow> = match supabase_get(
+        &ctx.env,
+        "player_tiers?select=gamemode,tier,players(id,username,region)&limit=10000",
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return upstream_err(e, o),
+    };
+
+    // gamemode -> (rank, username, region, tier)
+    let mut boards: Vec<(&str, Vec<(u8, String, Option<String>, String)>)> =
+        GAMEMODES.iter().map(|gm| (*gm, Vec::new())).collect();
+
+    for row in rows {
+        let Some(board) = boards.iter_mut().find(|(gm, _)| *gm == row.gamemode) else {
+            continue;
+        };
+        if filter.as_deref().is_some_and(|f| f != row.gamemode) {
+            continue;
+        }
+        let (Some(rank), Some(p)) = (tier_rank(&row.tier), row.players) else {
+            continue;
+        };
+        board
+            .1
+            .push((rank, p.username, p.region, row.tier.to_ascii_uppercase()));
+    }
+
+    let mut out = serde_json::Map::new();
+    for (gm, mut entries) in boards {
+        if filter.as_deref().is_some_and(|f| f != gm) {
+            continue;
+        }
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        });
+        let list: Vec<Value> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, username, region, tier))| {
+                json!({ "rank": i + 1, "username": username, "region": region, "tier": tier })
+            })
+            .collect();
+        out.insert(gm.to_string(), Value::Array(list));
+    }
+
+    json_ok(&json!({ "gamemodes": Value::Object(out) }), o)
+}
+
+/// Retired gamemodes (e.g. vanilla) are hidden from every response.
+fn is_active_gamemode(gm: &str) -> bool {
+    GAMEMODES.contains(&gm)
+}
+
+/// Points per tier for the global leaderboard. HT1 is the most, LT5 the least.
+/// PLACEHOLDER values (standard MCTiers scheme). Edit to match the real scoring.
+const POINTS: &[(&str, u32)] = &[
+    ("HT1", 60),
+    ("LT1", 45),
+    ("HT2", 30),
+    ("LT2", 20),
+    ("HT3", 10),
+    ("LT3", 6),
+    ("HT4", 4),
+    ("LT4", 3),
+    ("HT5", 2),
+    ("LT5", 1),
+];
+
+fn tier_points(tier: &str) -> Option<u32> {
+    let t = tier.to_ascii_uppercase();
+    POINTS.iter().find(|(k, _)| *k == t).map(|(_, p)| *p)
+}
+
+struct GlobalAgg {
+    username: String,
+    region: Option<String>,
+    points: u32,
+    tiers: Vec<(String, String)>,
+}
+
+/// GET /api/leaderboard/global[?limit=100]
+/// Players ranked by total points across all active gamemodes (most first).
+async fn get_global_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let origin = allowed_origin(&req, &ctx.env);
+    let o = origin.as_deref();
+    let limit = clamp_limit(&req, 100, 500) as usize;
+
+    let rows: Vec<LbRow> = match supabase_get(
+        &ctx.env,
+        "player_tiers?select=gamemode,tier,players(id,username,region)&limit=10000",
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return upstream_err(e, o),
+    };
+
+    let mut totals: HashMap<i64, GlobalAgg> = HashMap::new();
+    for row in rows {
+        if !is_active_gamemode(&row.gamemode) {
+            continue;
+        }
+        let (Some(p), Some(pts)) = (row.players, tier_points(&row.tier)) else {
+            continue;
+        };
+        let entry = totals.entry(p.id).or_insert_with(|| GlobalAgg {
+            username: p.username.clone(),
+            region: p.region.clone(),
+            points: 0,
+            tiers: Vec::new(),
+        });
+        entry.points += pts;
+        entry
+            .tiers
+            .push((row.gamemode, row.tier.to_ascii_uppercase()));
+    }
+
+    let mut list: Vec<GlobalAgg> = totals.into_values().collect();
+    list.sort_by(|a, b| {
+        b.points
+            .cmp(&a.points)
+            .then_with(|| a.username.to_lowercase().cmp(&b.username.to_lowercase()))
+    });
+
+    let items: Vec<Value> = list
+        .into_iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, e)| {
+            let tiers: Vec<Value> = e
+                .tiers
+                .iter()
+                .map(|(gm, t)| json!({ "gamemode": gm, "tier": t }))
+                .collect();
+            json!({
+                "rank": i + 1,
+                "username": e.username,
+                "region": e.region,
+                "points": e.points,
+                "tiers": tiers,
+            })
+        })
+        .collect();
+
+    json_ok(&json!({ "count": items.len(), "items": items }), o)
+}
+
+const BATCH_MAX: usize = 50;
+
+/// GET /api/players?names=a,b,c
+/// One Supabase query for up to BATCH_MAX names. Returns found players in
+/// `items` and any requested names that don't exist in `missing`.
+async fn get_players_batch(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let origin = allowed_origin(&req, &ctx.env);
+    let o = origin.as_deref();
+
+    let raw = req
+        .url()
+        .ok()
+        .and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == "names")
+                .map(|(_, v)| v.into_owned())
+        })
+        .unwrap_or_default();
+
+    // Lowercase, dedupe, keep the original casing for the response order.
+    let mut names: Vec<String> = Vec::new();
+    for part in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if !valid_username(part) {
+            return json_err(400, "invalid username in names", o);
+        }
+        let lower = part.to_lowercase();
+        if !names.contains(&lower) {
+            names.push(lower);
+        }
+    }
+    if names.is_empty() {
+        return json_err(400, "names is required (comma-separated)", o);
+    }
+    if names.len() > BATCH_MAX {
+        return json_err(400, "too many names (max 50)", o);
+    }
+
+    // Names are validated to [A-Za-z0-9_.], so no encoding is needed inside in.(...).
+    let path = format!(
+        "players?select=id,username,region,platform,player_tiers(gamemode,tier,updated_at)&username_lower=in.({})",
+        names.join(",")
+    );
+    let rows: Vec<PlayerRow> = match supabase_get(&ctx.env, &path).await {
+        Ok(r) => r,
+        Err(e) => return upstream_err(e, o),
+    };
+
+    let found: Vec<String> = rows.iter().map(|p| p.username.to_lowercase()).collect();
+    let missing: Vec<&String> = names.iter().filter(|n| !found.contains(n)).collect();
+    let items: Vec<Value> = rows.iter().map(player_json).collect();
+
+    json_ok(
+        &json!({ "count": items.len(), "items": items, "missing": missing }),
+        o,
+    )
+}
+
+fn player_json(p: &PlayerRow) -> Value {
+    let tiers: Vec<Value> = p
+        .player_tiers
+        .iter()
+        .filter(|t| is_active_gamemode(&t.gamemode))
+        .map(|t| json!({ "gamemode": t.gamemode, "tier": t.tier, "updatedAt": t.updated_at }))
+        .collect();
+    json!({
+        "id": p.id,
+        "username": p.username,
+        "region": p.region,
+        "platform": p.platform,
+        "tiers": tiers,
+    })
+}
+
 async fn get_gamemode_tiers(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let origin = allowed_origin(&req, &ctx.env);
     let o = origin.as_deref();
-    let gamemode = ctx.param("gamemode").map(|s| s.to_lowercase()).unwrap_or_default();
+    let gamemode = ctx
+        .param("gamemode")
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
     if !GAMEMODES.contains(&gamemode.as_str()) {
         return json_err(404, "unknown gamemode", o);
     }
@@ -213,7 +508,10 @@ async fn get_gamemode_tiers(req: Request, ctx: RouteContext<()>) -> Result<Respo
         .into_iter()
         .map(|r| json!({ "username": r.players.username, "tier": r.tier, "updatedAt": r.updated_at }))
         .collect();
-    json_ok(&json!({ "gamemode": gamemode, "count": items.len(), "items": items }), o)
+    json_ok(
+        &json!({ "gamemode": gamemode, "count": items.len(), "items": items }),
+        o,
+    )
 }
 
 async fn get_recent(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -230,6 +528,7 @@ async fn get_recent(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     };
     let items: Vec<Value> = rows
         .into_iter()
+        .filter(|r| is_active_gamemode(&r.gamemode))
         .map(|r| {
             json!({
                 "username": r.players.map(|p| p.username),
@@ -294,18 +593,23 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         headers.set("cache-control", CACHE_CONTROL)?;
         set_cors(&headers, o)?;
         headers.set("x-cache", "HIT")?;
-        return Ok(Response::from_bytes(body)?.with_status(status).with_headers(headers));
+        return Ok(Response::from_bytes(body)?
+            .with_status(status)
+            .with_headers(headers));
     }
 
     let mut resp = Router::new()
         .get("/api/health", |_, _| json_ok(&json!({ "ok": true }), None))
-        .get("/api/gamemodes", |_, _| json_ok(&json!({ "gamemodes": GAMEMODES }), None))
+        .get("/api/gamemodes", |_, _| {
+            json_ok(&json!({ "gamemodes": GAMEMODES }), None)
+        })
+        .get_async("/api/leaderboard", get_leaderboard)
+        .get_async("/api/leaderboard/global", get_global_leaderboard)
+        .get_async("/api/players", get_players_batch)
         .get_async("/api/players/:username", get_player)
         .get_async("/api/gamemodes/:gamemode/tiers", get_gamemode_tiers)
         .get_async("/api/recent", get_recent)
-        .or_else_any_method_async("/*path", |_, _| async {
-            json_err(404, "not found", None)
-        })
+        .or_else_any_method_async("/*path", |_, _| async { json_err(404, "not found", None) })
         .run(req, env)
         .await?;
 
