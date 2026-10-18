@@ -96,7 +96,7 @@ cargo check --target wasm32-unknown-unknown   # type-check only
 worker-build --release                        # produces build/worker/
 ```
 
-`wrangler deploy` runs `worker-build` automatically through the `[build]` command in `wrangler.toml`. Running it yourself is optional.
+`wrangler deploy` builds the Worker itself, using the `[build]` command in `wrangler.toml`. You don't need a separate build step.
 
 ## Run locally
 
@@ -120,13 +120,26 @@ To point local dev at a different Supabase project, pass `--var SUPABASE_URL:htt
    ```bash
    npx wrangler secret put SUPABASE_ANON_KEY
    ```
-3. Deploy:
+3. Deploy (this also builds the Worker):
    ```bash
    npx wrangler deploy
    ```
 4. Check the secret is present with `npx wrangler secret list`.
 
 Every deploy is a manual upload from your machine. There is no Git-based auto-deploy. Changing `SUPABASE_URL` or `ALLOWED_ORIGINS` means editing `wrangler.toml` and redeploying.
+
+## Cloudflare Workers Builds (dashboard)
+
+If the Worker is connected to a repo in the Cloudflare dashboard (**Workers & Pages → primetiers-api → Settings → Builds**), set these. The build image does not include Rust, so the build command installs it first.
+
+- **Build command:**
+  ```
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && . "$HOME/.cargo/env" && rustup target add wasm32-unknown-unknown && cargo install -q worker-build --version 0.7.5 --locked && worker-build --release
+  ```
+- **Deploy command:** `npx wrangler deploy` (it runs the `[build]` command from `wrangler.toml`, so the build step above is only needed to install Rust)
+- **Root directory:** the repo root (where `wrangler.toml` is)
+
+The first build is slow (several minutes) because it compiles `worker-build` from source. Later builds are faster if Cloudflare caches `~/.cargo`.
 
 ## Troubleshooting
 

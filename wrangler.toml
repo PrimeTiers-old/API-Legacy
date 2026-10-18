@@ -1,9 +1,16 @@
+#:schema node_modules/wrangler/config-schema.json
 name = "primetiers-api"
 main = "build/worker/shim.mjs"
 compatibility_date = "2025-01-01"
+workers_dev = true
 
+# `wrangler deploy` runs this first, so the Worker is always built from source.
+# worker-build 0.7.5 is pinned: 0.8.x fails in its wasm-bindgen step.
 [build]
-command = "cargo install -q worker-build --version 0.7.5 && worker-build --release"
+command = "cargo install -q worker-build --version 0.7.5 --locked && worker-build --release"
+
+[observability]
+enabled = true
 
 [vars]
 # Public Supabase project URL (not a secret).
@@ -11,5 +18,6 @@ SUPABASE_URL = "https://etrupginiwgbnygvczzs.supabase.co"
 # Comma-separated browser origins allowed to call the API.
 ALLOWED_ORIGINS = "https://primetiers.net"
 
-# Secret (set with: npx wrangler secret put SUPABASE_ANON_KEY).
-# Use the PUBLISHABLE/anon key only. Never the service-role key.
+# Secrets are not stored here. Set them with:
+#   npx wrangler secret put SUPABASE_ANON_KEY
+# Use the publishable/anon key only. Never the service-role key.
