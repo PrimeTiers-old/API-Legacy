@@ -198,7 +198,7 @@ async fn get_player(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .player_tiers
         .iter()
         .filter(|t| is_active_gamemode(&t.gamemode))
-        .map(|t| json!({ "gamemode": t.gamemode, "tier": t.tier, "updatedAt": t.updated_at }))
+        .map(|t| json!({ "gamemode": site_slug(&t.gamemode), "tier": t.tier, "updatedAt": t.updated_at }))
         .collect();
     json_ok(
         &json!({
@@ -253,7 +253,7 @@ async fn get_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
     let filter = req.url().ok().and_then(|u| {
         u.query_pairs()
             .find(|(k, _)| k == "gamemode")
-            .map(|(_, v)| v.to_lowercase())
+            .map(|(_, v)| db_slug(&v))
     });
     if let Some(gm) = &filter {
         if !GAMEMODES.contains(&gm.as_str()) {
@@ -307,10 +307,28 @@ async fn get_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
                 json!({ "rank": i + 1, "username": username, "region": region, "tier": tier })
             })
             .collect();
-        out.insert(gm.to_string(), Value::Array(list));
+        out.insert(site_slug(gm).to_string(), Value::Array(list));
     }
 
     json_ok(&json!({ "gamemodes": Value::Object(out) }), o)
+}
+
+/// Website slug for a database gamemode id. The site uses these names.
+fn site_slug(db: &str) -> &str {
+    match db {
+        "nethop" => "nethertite",
+        "macespear" => "mace-spear",
+        other => other,
+    }
+}
+
+/// Database gamemode id for a name sent by the site or the database. Accepts both.
+fn db_slug(input: &str) -> String {
+    match input.to_ascii_lowercase().as_str() {
+        "nethertite" => "nethop".to_string(),
+        "mace-spear" => "macespear".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Retired gamemodes (e.g. vanilla) are hidden from every response.
@@ -397,7 +415,7 @@ async fn get_global_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<R
             let tiers: Vec<Value> = e
                 .tiers
                 .iter()
-                .map(|(gm, t)| json!({ "gamemode": gm, "tier": t }))
+                .map(|(gm, t)| json!({ "gamemode": site_slug(gm), "tier": t }))
                 .collect();
             json!({
                 "rank": i + 1,
@@ -474,7 +492,7 @@ fn player_json(p: &PlayerRow) -> Value {
         .player_tiers
         .iter()
         .filter(|t| is_active_gamemode(&t.gamemode))
-        .map(|t| json!({ "gamemode": t.gamemode, "tier": t.tier, "updatedAt": t.updated_at }))
+        .map(|t| json!({ "gamemode": site_slug(&t.gamemode), "tier": t.tier, "updatedAt": t.updated_at }))
         .collect();
     json!({
         "id": p.id,
@@ -490,7 +508,7 @@ async fn get_gamemode_tiers(req: Request, ctx: RouteContext<()>) -> Result<Respo
     let o = origin.as_deref();
     let gamemode = ctx
         .param("gamemode")
-        .map(|s| s.to_lowercase())
+        .map(|s| db_slug(&s))
         .unwrap_or_default();
     if !GAMEMODES.contains(&gamemode.as_str()) {
         return json_err(404, "unknown gamemode", o);
@@ -509,7 +527,7 @@ async fn get_gamemode_tiers(req: Request, ctx: RouteContext<()>) -> Result<Respo
         .map(|r| json!({ "username": r.players.username, "tier": r.tier, "updatedAt": r.updated_at }))
         .collect();
     json_ok(
-        &json!({ "gamemode": gamemode, "count": items.len(), "items": items }),
+        &json!({ "gamemode": site_slug(&gamemode), "count": items.len(), "items": items }),
         o,
     )
 }
@@ -532,7 +550,7 @@ async fn get_recent(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         .map(|r| {
             json!({
                 "username": r.players.map(|p| p.username),
-                "gamemode": r.gamemode,
+                "gamemode": site_slug(&r.gamemode),
                 "tier": r.tier,
                 "previousTier": r.previous_tier,
                 "region": r.region,
@@ -601,7 +619,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let mut resp = Router::new()
         .get("/api/health", |_, _| json_ok(&json!({ "ok": true }), None))
         .get("/api/gamemodes", |_, _| {
-            json_ok(&json!({ "gamemodes": GAMEMODES }), None)
+            json_ok(
+                &json!({ "gamemodes": GAMEMODES.iter().map(|g| site_slug(g)).collect::<Vec<_>>() }),
+                None,
+            )
         })
         .get_async("/api/leaderboard", get_leaderboard)
         .get_async("/api/leaderboard/global", get_global_leaderboard)

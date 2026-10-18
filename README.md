@@ -2,7 +2,7 @@
 
 Public read-only API for PrimeTiers, written in Rust and running on a Cloudflare Worker. It reads from Supabase through PostgREST using the **publishable (anon) key**. The existing Row Level Security "public read" policies control what's visible. Writes stay in the Discord bot, which uses the service role key.
 
-Live URL: `https://primetiers-api.tennant-dalin01.workers.dev`
+Live URL: `https://api.primetiers.net` (custom domain on the `primetiers-api` Worker; the `workers.dev` address also still works)
 
 ## Endpoints
 
@@ -55,6 +55,12 @@ Tier order (best to worst): HT1, LT1, HT2, LT2, HT3, LT3, HT4, LT4, HT5, LT5. Ti
 
 Points per tier are set in `POINTS` in `src/lib.rs`. **The current values are placeholders** (HT1 60, LT1 45, HT2 30, LT2 20, HT3 10, LT3 6, HT4 4, LT4 3, HT5 2, LT5 1). Replace them with the real scoring, then rebuild and redeploy.
 
+### Gamemode names
+The API returns the website's gamemode names: `nethertite` (database `nethop`) and `mace-spear` (database `macespear`). Requests accept either name. Everything else uses the same ids in both places.
+
+### Website
+The site lives in `Website/` (also a Cloudflare Worker, named `primetiers`). It calls this API from the browser, so every origin that loads the site must be listed in `ALLOWED_ORIGINS` in `wrangler.toml`. Current origins: `https://primetiers.net`, the site's `workers.dev` address, and `http://localhost:5173` for Vite dev.
+
 ### Caching
 - Every GET response is stored at the Cloudflare edge for **60 seconds**, keyed by full URL. Repeat requests return `x-cache: HIT` and don't call Supabase.
 - 200, 400, and 404 responses are cached. Upstream errors (502) are never cached.
@@ -65,7 +71,7 @@ Fetch many players in one request:
 
 ```js
 const res = await fetch(
-  "https://primetiers-api.tennant-dalin01.workers.dev/api/players?names=" +
+  "https://api.primetiers.net/api/players?names=" +
     encodeURIComponent(names.join(","))
 );
 const { items, missing } = await res.json();

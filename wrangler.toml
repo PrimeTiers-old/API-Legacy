@@ -4,6 +4,11 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2025-01-01"
 workers_dev = true
 
+# Custom domain. Requires primetiers.net to be a zone on this Cloudflare account.
+[[routes]]
+pattern = "api.primetiers.net"
+custom_domain = true
+
 # `wrangler deploy` runs this first, so the Worker is always built from source.
 # worker-build 0.7.5 is pinned: 0.8.x fails in its wasm-bindgen step.
 [build]
@@ -16,7 +21,7 @@ enabled = true
 # Public Supabase project URL (not a secret).
 SUPABASE_URL = "https://etrupginiwgbnygvczzs.supabase.co"
 # Comma-separated browser origins allowed to call the API.
-ALLOWED_ORIGINS = "https://primetiers.net"
+ALLOWED_ORIGINS = "https://primetiers.net,https://primetiers.tennant-dalin01.workers.dev,http://localhost:5173"
 
 # Secrets are not stored here. Set them with:
 #   npx wrangler secret put SUPABASE_ANON_KEY
