@@ -167,6 +167,28 @@ async fn supabase_get<T: for<'de> Deserialize<'de>>(env: &Env, path_and_query: &
     resp.json::<T>().await
 }
 
+/// PostgREST caps each response at max_rows (1000 by default), so one request
+/// silently truncates a big table. This pages through the whole table instead.
+/// Ordered by (player_id, gamemode), which is unique, so pages never overlap.
+const PAGE_SIZE: u32 = 1000;
+const MAX_PAGES: u32 = 20; // 20,000 rows ceiling
+
+async fn supabase_get_all<T: for<'de> Deserialize<'de>>(env: &Env, base: &str) -> Result<Vec<T>> {
+    let mut out: Vec<T> = Vec::new();
+    for page in 0..MAX_PAGES {
+        let offset = page * PAGE_SIZE;
+        let path = format!("{base}&order=player_id.asc,gamemode.asc&limit={PAGE_SIZE}&offset={offset}");
+        let rows: Vec<T> = supabase_get(env, &path).await?;
+        let n = rows.len();
+        out.extend(rows);
+        if n < PAGE_SIZE as usize {
+            return Ok(out);
+        }
+    }
+    console_error!("leaderboard reached {} rows, raise MAX_PAGES", MAX_PAGES * PAGE_SIZE);
+    Ok(out)
+}
+
 /// Maps Supabase failures to 502 and logs the detail (never the key).
 fn upstream_err(e: Error, origin: Option<&str>) -> Result<Response> {
     console_error!("upstream error: {e}");
@@ -263,10 +285,9 @@ async fn get_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     }
 
-    // PostgREST returns at most max_rows (default 1000). Fine until the tier table gets that big.
-    let rows: Vec<LbRow> = match supabase_get(
+    let rows: Vec<LbRow> = match supabase_get_all(
         &ctx.env,
-        "player_tiers?select=gamemode,tier,players(id,username,region)&limit=10000",
+        "player_tiers?select=gamemode,tier,players(id,username,region)",
     )
     .await
     {
@@ -372,9 +393,9 @@ async fn get_global_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<R
     let o = origin.as_deref();
     let limit = clamp_limit(&req, 100, 500) as usize;
 
-    let rows: Vec<LbRow> = match supabase_get(
+    let rows: Vec<LbRow> = match supabase_get_all(
         &ctx.env,
-        "player_tiers?select=gamemode,tier,players(id,username,region)&limit=10000",
+        "player_tiers?select=gamemode,tier,players(id,username,region)",
     )
     .await
     {
