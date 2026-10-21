@@ -1,1 +1,2 @@
-SUPABASE_ANON_KEY=your_publishable_or_anon_key
+# MongoDB Atlas connection string. Use an Atlas database user with read access.
+MONGODB_URI=mongodb+srv://USER:PASSWORD@cluster0.example.mongodb.net/?retryWrites=true&w=majority

@@ -1,8 +1,7 @@
 //! PrimeTiers public read API, running on Cloudflare Workers (Rust / Wasm).
 //!
-//! Reads from Supabase PostgREST with the publishable (anon) key. The tables
-//! exposed here already have "public read" RLS policies, so no privileged key
-//! is needed. Writes stay in the Discord bot, which uses the service role.
+//! Reads from MongoDB Atlas through the small wire-protocol client in
+//! `mongo.rs`. The API is read-only; all writes stay in the Discord bot.
 //!
 //! Routes:
 //!   GET /api/health
@@ -11,7 +10,11 @@
 //!   GET /api/gamemodes/:gamemode/tiers?limit=50
 //!   GET /api/recent?limit=20
 
-use serde::{Deserialize, Serialize};
+mod mongo;
+
+use bson::{doc, Bson, Document};
+use mongo::Mongo;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use worker::*;
@@ -33,14 +36,13 @@ const GAMEMODES: &[&str] = &[
 const CACHE_TTL_SECONDS: u32 = 300;
 const CACHE_CONTROL: &str = "public, max-age=300, s-maxage=300";
 
-#[derive(Deserialize)]
+#[derive(Clone)]
 struct PlayerTier {
     gamemode: String,
     tier: String,
     updated_at: String,
 }
 
-#[derive(Deserialize)]
 struct PlayerRow {
     id: i64,
     username: String,
@@ -49,31 +51,48 @@ struct PlayerRow {
     player_tiers: Vec<PlayerTier>,
 }
 
-#[derive(Deserialize)]
-struct PlayerRef {
-    username: String,
-}
-
-#[derive(Deserialize)]
-struct TierRow {
-    tier: String,
-    updated_at: String,
-    players: PlayerRef,
-}
-
-#[derive(Deserialize)]
-struct LogRow {
-    gamemode: String,
-    tier: String,
-    previous_tier: Option<String>,
-    region: Option<String>,
-    created_at: String,
-    players: Option<PlayerRef>,
-}
-
 #[derive(Serialize)]
 struct ApiError<'a> {
     error: &'a str,
+}
+
+fn doc_i64(d: &Document, key: &str) -> Option<i64> {
+    match d.get(key)? {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(n) => Some(*n as i64),
+        _ => None,
+    }
+}
+
+fn doc_string(d: &Document, key: &str) -> Option<String> {
+    match d.get(key)? {
+        Bson::String(s) => Some(s.clone()),
+        // The Supabase -> MongoDB migration left some timestamp columns as
+        // strings and some as BSON dates. Accept both.
+        Bson::DateTime(dt) => dt.try_to_rfc3339_string().ok(),
+        Bson::Int32(n) => Some(n.to_string()),
+        Bson::Int64(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn tier_from_doc(d: &Document) -> Option<PlayerTier> {
+    Some(PlayerTier {
+        gamemode: doc_string(d, "gamemode")?,
+        tier: doc_string(d, "tier")?,
+        updated_at: doc_string(d, "updated_at")?,
+    })
+}
+
+fn player_from_doc(d: &Document) -> Option<PlayerRow> {
+    Some(PlayerRow {
+        id: doc_i64(d, "_id")?,
+        username: doc_string(d, "username")?,
+        region: doc_string(d, "region"),
+        platform: doc_string(d, "platform"),
+        player_tiers: Vec::new(),
+    })
 }
 
 fn with_common_headers(
@@ -119,8 +138,7 @@ fn allowed_origin(req: &Request, env: &Env) -> Option<String> {
         .then_some(origin)
 }
 
-/// Usernames: 1–32 chars of letters, digits, underscore, dot. Keeps the value
-/// safe to put into a PostgREST query string without any encoding.
+/// Usernames: 1–32 chars of letters, digits, underscore, dot.
 fn valid_username(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 32
@@ -140,59 +158,53 @@ fn clamp_limit(req: &Request, default: u32, max: u32) -> u32 {
         .clamp(1, max)
 }
 
-/// Calls PostgREST: GET {SUPABASE_URL}/rest/v1/{path_and_query}
-async fn supabase_get<T: for<'de> Deserialize<'de>>(env: &Env, path_and_query: &str) -> Result<T> {
-    let base = env.var("SUPABASE_URL")?.to_string();
-    let key = env.secret("SUPABASE_ANON_KEY")?.to_string();
-    let url = format!("{}/rest/v1/{}", base.trim_end_matches('/'), path_and_query);
-
-    let headers = Headers::new();
-    headers.set("apikey", &key)?;
-    headers.set("authorization", &format!("Bearer {key}"))?;
-    headers.set("accept", "application/json")?;
-
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
-    let request = Request::new_with_init(&url, &init)?;
-
-    let mut resp = Fetch::Request(request).send().await?;
-    if resp.status_code() >= 400 {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(Error::RustError(format!(
-            "supabase {}: {}",
-            resp.status_code(),
-            text
-        )));
-    }
-    resp.json::<T>().await
+/// Maps MongoDB failures to 502 and logs the detail (never the URI/password).
+fn db_err(e: Error, origin: Option<&str>) -> Result<Response> {
+    console_error!("mongo error: {e}");
+    json_err(502, "upstream unavailable", origin)
 }
 
-/// PostgREST caps each response at max_rows (1000 by default), so one request
-/// silently truncates a big table. This pages through the whole table instead.
-/// Ordered by (player_id, gamemode), which is unique, so pages never overlap.
-const PAGE_SIZE: u32 = 1000;
-const MAX_PAGES: u32 = 20; // 20,000 rows ceiling
+fn ids_filter(field: &str, ids: &[i64]) -> Document {
+    let values: Vec<Bson> = ids.iter().copied().map(Bson::Int64).collect();
+    doc! { field: { "$in": Bson::Array(values) } }
+}
 
-async fn supabase_get_all<T: for<'de> Deserialize<'de>>(env: &Env, base: &str) -> Result<Vec<T>> {
-    let mut out: Vec<T> = Vec::new();
-    for page in 0..MAX_PAGES {
-        let offset = page * PAGE_SIZE;
-        let path = format!("{base}&order=player_id.asc,gamemode.asc&limit={PAGE_SIZE}&offset={offset}");
-        let rows: Vec<T> = supabase_get(env, &path).await?;
-        let n = rows.len();
-        out.extend(rows);
-        if n < PAGE_SIZE as usize {
-            return Ok(out);
-        }
+async fn fetch_players_by_ids(db: &mut Mongo, ids: &[i64]) -> Result<Vec<PlayerRow>> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(1000) {
+        let rows = db
+            .find(
+                "players",
+                ids_filter("_id", chunk),
+                None,
+                None,
+                None,
+            )
+            .await?;
+        out.extend(rows.iter().filter_map(player_from_doc));
     }
-    console_error!("leaderboard reached {} rows, raise MAX_PAGES", MAX_PAGES * PAGE_SIZE);
     Ok(out)
 }
 
-/// Maps Supabase failures to 502 and logs the detail (never the key).
-fn upstream_err(e: Error, origin: Option<&str>) -> Result<Response> {
-    console_error!("upstream error: {e}");
-    json_err(502, "upstream unavailable", origin)
+async fn fetch_tiers_by_player_ids(db: &mut Mongo, ids: &[i64]) -> Result<Vec<(i64, PlayerTier)>> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(1000) {
+        let rows = db
+            .find(
+                "player_tiers",
+                ids_filter("player_id", chunk),
+                None,
+                None,
+                None,
+            )
+            .await?;
+        for row in rows {
+            if let (Some(player_id), Some(tier)) = (doc_i64(&row, "player_id"), tier_from_doc(&row)) {
+                out.push((player_id, tier));
+            }
+        }
+    }
+    Ok(out)
 }
 
 async fn get_player(req: Request, ctx: RouteContext<()>) -> Result<Response> {
@@ -206,48 +218,32 @@ async fn get_player(req: Request, ctx: RouteContext<()>) -> Result<Response> {
         return json_err(400, "invalid username", o);
     }
 
-    let path = format!(
-        "players?select=id,username,region,platform,player_tiers(gamemode,tier,updated_at)&username_lower=eq.{}&limit=1",
-        name.to_lowercase()
-    );
-    let rows: Vec<PlayerRow> = match supabase_get(&ctx.env, &path).await {
-        Ok(r) => r,
-        Err(e) => return upstream_err(e, o),
+    let mut db = match Mongo::connect(&ctx.env).await {
+        Ok(db) => db,
+        Err(e) => return db_err(e, o),
     };
-    let Some(p) = rows.into_iter().next() else {
+
+    let filter = doc! { "username_lower": name.to_lowercase() };
+    let rows = match db.find("players", filter, None, Some(1), None).await {
+        Ok(r) => r,
+        Err(e) => return db_err(e, o),
+    };
+    let Some(mut player) = rows.first().and_then(player_from_doc) else {
         return json_err(404, "player not found", o);
     };
 
-    let tiers: Vec<Value> = p
-        .player_tiers
-        .iter()
-        .filter(|t| is_active_gamemode(&t.gamemode))
-        .map(|t| json!({ "gamemode": site_slug(&t.gamemode), "tier": t.tier, "updatedAt": t.updated_at }))
-        .collect();
-    json_ok(
-        &json!({
-            "id": p.id,
-            "username": p.username,
-            "region": p.region,
-            "platform": p.platform,
-            "tiers": tiers,
-        }),
-        o,
-    )
+    let tiers = match fetch_tiers_by_player_ids(&mut db, &[player.id]).await {
+        Ok(t) => t,
+        Err(e) => return db_err(e, o),
+    };
+    player.player_tiers = tiers.into_iter().map(|(_, t)| t).collect();
+
+    json_ok(&player_json(&player), o)
 }
 
-#[derive(Deserialize)]
 struct LbPlayer {
-    id: i64,
     username: String,
     region: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct LbRow {
-    gamemode: String,
-    tier: String,
-    players: Option<LbPlayer>,
 }
 
 /// HT1 is the highest tier. Lower rank number = better.
@@ -267,9 +263,16 @@ fn tier_rank(tier: &str) -> Option<u8> {
     }
 }
 
+/// Active gamemode filter for a MongoDB query.
+fn active_gamemodes_filter() -> Document {
+    let values: Vec<Bson> = GAMEMODES
+        .iter()
+        .map(|g| Bson::String((*g).to_string()))
+        .collect();
+    doc! { "$in": Bson::Array(values) }
+}
+
 /// GET /api/leaderboard[?gamemode=macespear]
-/// Every gamemode's ranking in one Supabase query, sorted HT1 first.
-/// Edge-cached like every other GET, so visitors share one upstream call per minute.
 async fn get_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let origin = allowed_origin(&req, &ctx.env);
     let o = origin.as_deref();
@@ -285,33 +288,66 @@ async fn get_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response
         }
     }
 
-    let rows: Vec<LbRow> = match supabase_get_all(
-        &ctx.env,
-        "player_tiers?select=gamemode,tier,players(id,username,region)",
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return upstream_err(e, o),
+    let mut db = match Mongo::connect(&ctx.env).await {
+        Ok(db) => db,
+        Err(e) => return db_err(e, o),
     };
+
+    let gm_filter = match &filter {
+        Some(gm) => doc! { "gamemode": gm.clone() },
+        None => doc! { "gamemode": active_gamemodes_filter() },
+    };
+    let rows = match db.find("player_tiers", gm_filter, None, None, None).await {
+        Ok(r) => r,
+        Err(e) => return db_err(e, o),
+    };
+
+    let mut player_ids: Vec<i64> = rows.iter().filter_map(|r| doc_i64(r, "player_id")).collect();
+    player_ids.sort_unstable();
+    player_ids.dedup();
+    let players = match fetch_players_by_ids(&mut db, &player_ids).await {
+        Ok(p) => p,
+        Err(e) => return db_err(e, o),
+    };
+    let by_id: HashMap<i64, LbPlayer> = players
+        .into_iter()
+        .map(|p| {
+            (
+                p.id,
+                LbPlayer {
+                    username: p.username,
+                    region: p.region,
+                },
+            )
+        })
+        .collect();
 
     // gamemode -> (rank, username, region, tier)
     let mut boards: Vec<(&str, Vec<(u8, String, Option<String>, String)>)> =
         GAMEMODES.iter().map(|gm| (*gm, Vec::new())).collect();
 
     for row in rows {
-        let Some(board) = boards.iter_mut().find(|(gm, _)| *gm == row.gamemode) else {
+        let Some(gamemode) = doc_string(&row, "gamemode") else {
             continue;
         };
-        if filter.as_deref().is_some_and(|f| f != row.gamemode) {
+        let Some(board) = boards.iter_mut().find(|(gm, _)| *gm == gamemode) else {
             continue;
-        }
-        let (Some(rank), Some(p)) = (tier_rank(&row.tier), row.players) else {
+        };
+        let Some(player_id) = doc_i64(&row, "player_id") else {
+            continue;
+        };
+        let Some(p) = by_id.get(&player_id) else {
+            continue;
+        };
+        let Some(tier) = doc_string(&row, "tier") else {
+            continue;
+        };
+        let Some(rank) = tier_rank(&tier) else {
             continue;
         };
         board
             .1
-            .push((rank, p.username, p.region, row.tier.to_ascii_uppercase()));
+            .push((rank, p.username.clone(), p.region.clone(), tier.to_ascii_uppercase()));
     }
 
     let mut out = serde_json::Map::new();
@@ -387,40 +423,70 @@ struct GlobalAgg {
 }
 
 /// GET /api/leaderboard/global[?limit=100]
-/// Players ranked by total points across all active gamemodes (most first).
 async fn get_global_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let origin = allowed_origin(&req, &ctx.env);
     let o = origin.as_deref();
     let limit = clamp_limit(&req, 100, 500) as usize;
 
-    let rows: Vec<LbRow> = match supabase_get_all(
-        &ctx.env,
-        "player_tiers?select=gamemode,tier,players(id,username,region)",
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return upstream_err(e, o),
+    let mut db = match Mongo::connect(&ctx.env).await {
+        Ok(db) => db,
+        Err(e) => return db_err(e, o),
     };
+
+    let filter = doc! { "gamemode": active_gamemodes_filter() };
+    let rows = match db.find("player_tiers", filter, None, None, None).await {
+        Ok(r) => r,
+        Err(e) => return db_err(e, o),
+    };
+
+    let mut player_ids: Vec<i64> = rows.iter().filter_map(|r| doc_i64(r, "player_id")).collect();
+    player_ids.sort_unstable();
+    player_ids.dedup();
+    let players = match fetch_players_by_ids(&mut db, &player_ids).await {
+        Ok(p) => p,
+        Err(e) => return db_err(e, o),
+    };
+    let by_id: HashMap<i64, LbPlayer> = players
+        .into_iter()
+        .map(|p| {
+            (
+                p.id,
+                LbPlayer {
+                    username: p.username,
+                    region: p.region,
+                },
+            )
+        })
+        .collect();
 
     let mut totals: HashMap<i64, GlobalAgg> = HashMap::new();
     for row in rows {
-        if !is_active_gamemode(&row.gamemode) {
-            continue;
-        }
-        let (Some(p), Some(pts)) = (row.players, tier_points(&row.tier)) else {
+        let Some(gamemode) = doc_string(&row, "gamemode") else {
             continue;
         };
-        let entry = totals.entry(p.id).or_insert_with(|| GlobalAgg {
+        if !is_active_gamemode(&gamemode) {
+            continue;
+        }
+        let Some(player_id) = doc_i64(&row, "player_id") else {
+            continue;
+        };
+        let Some(p) = by_id.get(&player_id) else {
+            continue;
+        };
+        let Some(tier) = doc_string(&row, "tier") else {
+            continue;
+        };
+        let Some(pts) = tier_points(&tier) else {
+            continue;
+        };
+        let entry = totals.entry(player_id).or_insert_with(|| GlobalAgg {
             username: p.username.clone(),
             region: p.region.clone(),
             points: 0,
             tiers: Vec::new(),
         });
         entry.points += pts;
-        entry
-            .tiers
-            .push((row.gamemode, row.tier.to_ascii_uppercase()));
+        entry.tiers.push((gamemode, tier.to_ascii_uppercase()));
     }
 
     let mut list: Vec<GlobalAgg> = totals.into_values().collect();
@@ -456,8 +522,6 @@ async fn get_global_leaderboard(req: Request, ctx: RouteContext<()>) -> Result<R
 const BATCH_MAX: usize = 50;
 
 /// GET /api/players?names=a,b,c
-/// One Supabase query for up to BATCH_MAX names. Returns found players in
-/// `items` and any requested names that don't exist in `missing`.
 async fn get_players_batch(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let origin = allowed_origin(&req, &ctx.env);
     let o = origin.as_deref();
@@ -490,19 +554,33 @@ async fn get_players_batch(req: Request, ctx: RouteContext<()>) -> Result<Respon
         return json_err(400, "too many names (max 50)", o);
     }
 
-    // Names are validated to [A-Za-z0-9_.], so no encoding is needed inside in.(...).
-    let path = format!(
-        "players?select=id,username,region,platform,player_tiers(gamemode,tier,updated_at)&username_lower=in.({})",
-        names.join(",")
-    );
-    let rows: Vec<PlayerRow> = match supabase_get(&ctx.env, &path).await {
-        Ok(r) => r,
-        Err(e) => return upstream_err(e, o),
+    let mut db = match Mongo::connect(&ctx.env).await {
+        Ok(db) => db,
+        Err(e) => return db_err(e, o),
     };
 
-    let found: Vec<String> = rows.iter().map(|p| p.username.to_lowercase()).collect();
+    let values: Vec<Bson> = names.iter().map(|n| Bson::String(n.clone())).collect();
+    let filter = doc! { "username_lower": { "$in": Bson::Array(values) } };
+    let rows = match db.find("players", filter, None, None, None).await {
+        Ok(r) => r,
+        Err(e) => return db_err(e, o),
+    };
+
+    let mut players: Vec<PlayerRow> = rows.iter().filter_map(player_from_doc).collect();
+    let ids: Vec<i64> = players.iter().map(|p| p.id).collect();
+    let tiers = match fetch_tiers_by_player_ids(&mut db, &ids).await {
+        Ok(t) => t,
+        Err(e) => return db_err(e, o),
+    };
+    for (player_id, tier) in tiers {
+        if let Some(player) = players.iter_mut().find(|p| p.id == player_id) {
+            player.player_tiers.push(tier);
+        }
+    }
+
+    let found: Vec<String> = players.iter().map(|p| p.username.to_lowercase()).collect();
     let missing: Vec<&String> = names.iter().filter(|n| !found.contains(n)).collect();
-    let items: Vec<Value> = rows.iter().map(player_json).collect();
+    let items: Vec<Value> = players.iter().map(player_json).collect();
 
     json_ok(
         &json!({ "count": items.len(), "items": items, "missing": missing }),
@@ -515,7 +593,13 @@ fn player_json(p: &PlayerRow) -> Value {
         .player_tiers
         .iter()
         .filter(|t| is_active_gamemode(&t.gamemode))
-        .map(|t| json!({ "gamemode": site_slug(&t.gamemode), "tier": t.tier, "updatedAt": t.updated_at }))
+        .map(|t| {
+            json!({
+                "gamemode": site_slug(&t.gamemode),
+                "tier": t.tier,
+                "updatedAt": t.updated_at
+            })
+        })
         .collect();
     json!({
         "id": p.id,
@@ -538,16 +622,39 @@ async fn get_gamemode_tiers(req: Request, ctx: RouteContext<()>) -> Result<Respo
     }
     let limit = clamp_limit(&req, 50, 100);
 
-    let path = format!(
-        "player_tiers?select=tier,updated_at,players(username)&gamemode=eq.{gamemode}&order=updated_at.desc&limit={limit}"
-    );
-    let rows: Vec<TierRow> = match supabase_get(&ctx.env, &path).await {
-        Ok(r) => r,
-        Err(e) => return upstream_err(e, o),
+    let mut db = match Mongo::connect(&ctx.env).await {
+        Ok(db) => db,
+        Err(e) => return db_err(e, o),
     };
+
+    let filter = doc! { "gamemode": gamemode.clone() };
+    let sort = doc! { "updated_at": -1i32 };
+    let rows = match db
+        .find("player_tiers", filter, Some(sort), Some(limit as i64), None)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return db_err(e, o),
+    };
+
+    let ids: Vec<i64> = rows.iter().filter_map(|r| doc_i64(r, "player_id")).collect();
+    let players = match fetch_players_by_ids(&mut db, &ids).await {
+        Ok(p) => p,
+        Err(e) => return db_err(e, o),
+    };
+    let by_id: HashMap<i64, String> = players.into_iter().map(|p| (p.id, p.username)).collect();
+
     let items: Vec<Value> = rows
         .into_iter()
-        .map(|r| json!({ "username": r.players.username, "tier": r.tier, "updatedAt": r.updated_at }))
+        .filter_map(|r| {
+            let player_id = doc_i64(&r, "player_id")?;
+            let username = by_id.get(&player_id)?;
+            Some(json!({
+                "username": username,
+                "tier": doc_string(&r, "tier")?,
+                "updatedAt": doc_string(&r, "updated_at")?,
+            }))
+        })
         .collect();
     json_ok(
         &json!({ "gamemode": site_slug(&gamemode), "count": items.len(), "items": items }),
@@ -560,32 +667,50 @@ async fn get_recent(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let o = origin.as_deref();
     let limit = clamp_limit(&req, 20, 100);
 
-    let path = format!(
-        "test_log?select=gamemode,tier,previous_tier,region,created_at,players!test_log_player_id_fkey(username)&order=created_at.desc&limit={limit}"
-    );
-    let rows: Vec<LogRow> = match supabase_get(&ctx.env, &path).await {
-        Ok(r) => r,
-        Err(e) => return upstream_err(e, o),
+    let mut db = match Mongo::connect(&ctx.env).await {
+        Ok(db) => db,
+        Err(e) => return db_err(e, o),
     };
+
+    let filter = doc! { "gamemode": active_gamemodes_filter() };
+    let sort = doc! { "created_at": -1i32 };
+    let rows = match db
+        .find("test_log", filter, Some(sort), Some(limit as i64), None)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return db_err(e, o),
+    };
+
+    let ids: Vec<i64> = rows.iter().filter_map(|r| doc_i64(r, "player_id")).collect();
+    let players = match fetch_players_by_ids(&mut db, &ids).await {
+        Ok(p) => p,
+        Err(e) => return db_err(e, o),
+    };
+    let by_id: HashMap<i64, String> = players.into_iter().map(|p| (p.id, p.username)).collect();
+
     let items: Vec<Value> = rows
         .into_iter()
-        .filter(|r| is_active_gamemode(&r.gamemode))
-        .map(|r| {
-            json!({
-                "username": r.players.map(|p| p.username),
-                "gamemode": site_slug(&r.gamemode),
-                "tier": r.tier,
-                "previousTier": r.previous_tier,
-                "region": r.region,
-                "createdAt": r.created_at,
-            })
+        .filter_map(|r| {
+            let gamemode = doc_string(&r, "gamemode")?;
+            if !is_active_gamemode(&gamemode) {
+                return None;
+            }
+            Some(json!({
+                "username": doc_i64(&r, "player_id").and_then(|id| by_id.get(&id).cloned()),
+                "gamemode": site_slug(&gamemode),
+                "tier": doc_string(&r, "tier")?,
+                "previousTier": doc_string(&r, "previous_tier"),
+                "region": doc_string(&r, "region"),
+                "createdAt": doc_string(&r, "created_at")?,
+            }))
         })
         .collect();
     json_ok(&json!({ "count": items.len(), "items": items }), o)
 }
 
 /// Edge cache TTL for successful and client-error GET responses. Upstream
-/// (Supabase) errors are never cached.
+/// (MongoDB) errors are never cached.
 const EDGE_TTL_SECONDS: u32 = CACHE_TTL_SECONDS;
 
 fn set_cors(headers: &Headers, origin: Option<&str>) -> Result<()> {

@@ -4,6 +4,9 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2025-01-01"
 workers_dev = true
 
+# Outbound TCP is required to reach MongoDB Atlas on port 27017.
+compatibility_flags = []
+
 # Custom domain. Requires primetiers.net to be a zone on this Cloudflare account.
 [[routes]]
 pattern = "api.primetiers.net"
@@ -18,11 +21,11 @@ command = "cargo install -q worker-build --version 0.7.5 --locked && worker-buil
 enabled = true
 
 [vars]
-# Public Supabase project URL (not a secret).
-SUPABASE_URL = "https://etrupginiwgbnygvczzs.supabase.co"
+# MongoDB database name (not secret).
+MONGODB_DB = "primetiers"
 # Comma-separated browser origins allowed to call the API.
 ALLOWED_ORIGINS = "https://primetiers.net,https://website.eufjbiasdjbfjasdf.workers.dev,http://localhost:5173"
 
 # Secrets are not stored here. Set them with:
-#   npx wrangler secret put SUPABASE_ANON_KEY
-# Use the publishable/anon key only. Never the service-role key.
+#   npx wrangler secret put MONGODB_URI
+# The Atlas database user only needs read access to the primetiers database.
