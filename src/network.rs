@@ -8,8 +8,12 @@
 //! Routes:
 //!   POST /api/network/report        public, one report per IP per minute.
 //!                                   Returns a token for the follow-up below.
-//!   POST /api/network/report/extra  adds the hand-run Karachi ping and/or
-//!                                   tracert to that report (within an hour)
+//!   POST /api/network/report/extra  adds the player's tracert output to
+//!                                   that report (once, within an hour)
+//!
+//! Each result stores the raw round-trip `samples` (ms, in the order taken)
+//! plus stats the API computes from them: `ms` (median), `min`, `max` and
+//! `jitter` (mean change between consecutive samples, as in RFC 3550).
 //!
 //! Read the reports straight from MongoDB; there is no read endpoint.
 
@@ -36,6 +40,8 @@ const RELAY_ASNS: &[u32] = &[13335, 36183, 54113];
 /// (`Website/src/network.js`), e.g. `vultr-bom`, so adding a provider there
 /// needs no API change.
 const MAX_RESULTS: usize = 40;
+/// Most samples kept per target.
+const MAX_SAMPLES: usize = 50;
 
 /// Target ids: 1-32 chars of lowercase letters, digits and `-`.
 fn valid_target(id: &str) -> bool {
@@ -56,22 +62,61 @@ struct ReportIn {
 #[derive(Deserialize)]
 struct ExtraIn {
     token: String,
-    #[serde(default)]
-    khi_ms: Option<f64>,
-    #[serde(default)]
-    trace: Option<String>,
+    trace: String,
 }
 
 #[derive(Deserialize)]
 struct ResultIn {
     id: String,
-    /// Median round trip in ms; null when the test failed.
-    ms: Option<f64>,
+    /// Round trips in ms, in the order taken. Empty when the test failed.
     #[serde(default)]
-    min: Option<f64>,
-    /// true when the visitor typed the number in (ICMP-only targets).
-    #[serde(default)]
-    manual: bool,
+    samples: Vec<f64>,
+}
+
+/// Rounds valid samples to 0.1 ms and drops anything out of range.
+fn clean_samples(raw: Vec<f64>) -> Vec<f64> {
+    raw.into_iter()
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 10_000.0)
+        .take(MAX_SAMPLES)
+        .map(|n| (n * 10.0).round() / 10.0)
+        .collect()
+}
+
+fn round1(n: f64) -> Bson {
+    Bson::Double((n * 10.0).round() / 10.0)
+}
+
+/// Builds the stored result: raw samples plus median, min, max and jitter.
+/// All stats are null when there are no samples (the target failed).
+fn result_doc(id: String, samples: Vec<f64>) -> Document {
+    if samples.is_empty() {
+        return doc! {
+            "target": id, "ms": Bson::Null, "min": Bson::Null, "max": Bson::Null,
+            "jitter": Bson::Null, "samples": [],
+        };
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    let median = if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    };
+    let jitter = if n > 1 {
+        let total: f64 = samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+        round1(total / (n - 1) as f64)
+    } else {
+        Bson::Null
+    };
+    doc! {
+        "target": id,
+        "ms": round1(median),
+        "min": round1(sorted[0]),
+        "max": round1(sorted[n - 1]),
+        "jitter": jitter,
+        "samples": samples.into_iter().map(Bson::Double).collect::<Vec<_>>(),
+    }
 }
 
 fn reply(status: u16, body: &Value, origin: Option<&str>) -> Result<Response> {
@@ -94,12 +139,6 @@ fn err(status: u16, msg: &str, origin: Option<&str>) -> Result<Response> {
 fn db_err(e: Error, origin: Option<&str>) -> Result<Response> {
     console_error!("network mongo error: {e}");
     err(502, "upstream unavailable", origin)
-}
-
-fn clean_ms(v: Option<f64>) -> Bson {
-    v.filter(|n| n.is_finite() && *n >= 0.0 && *n <= 10_000.0)
-        .map(|n| Bson::Double((n * 10.0).round() / 10.0))
-        .unwrap_or(Bson::Null)
 }
 
 fn random_token() -> String {
@@ -158,12 +197,7 @@ async fn post_report(mut req: Request, env: &Env, origin: Option<&str>) -> Resul
                 return None;
             }
             seen.push(r.id.clone());
-            Some(Bson::Document(doc! {
-                "target": r.id,
-                "ms": clean_ms(r.ms),
-                "min": clean_ms(r.min),
-                "manual": r.manual,
-            }))
+            Some(Bson::Document(result_doc(r.id, clean_samples(r.samples))))
         })
         .collect();
     if results.is_empty() {
@@ -246,30 +280,17 @@ async fn post_extra(mut req: Request, env: &Env, origin: Option<&str>) -> Result
         return err(400, "invalid token", origin);
     }
 
-    let mut update = Document::new();
-    let mut set = Document::new();
-    if let Some(trace) = clean_trace(input.trace) {
-        set.insert("traceroute", trace);
-    }
-    if let Bson::Double(ms) = clean_ms(input.khi_ms) {
-        update.insert(
-            "$push",
-            doc! { "results": { "target": "lightnode-khi", "ms": ms, "min": Bson::Null, "manual": true } },
-        );
-    }
-    if set.is_empty() && update.is_empty() {
+    let Some(trace) = clean_trace(Some(input.trace)) else {
         return err(400, "nothing to add", origin);
-    }
-    if !set.is_empty() {
-        update.insert("$set", set);
-    }
+    };
+    let update = doc! { "$set": { "traceroute": trace } };
 
     let now = now_utc().timestamp_millis();
     let filter = doc! {
         "token": &input.token,
         "created_at": { "$gt": DateTime::from_millis(now - EXTRA_WINDOW_MS) },
-        // Only one hand-entered Karachi result per report.
-        "results.target": { "$ne": "lightnode-khi" },
+        // Once per report.
+        "traceroute": Bson::Null,
     };
     let mut db = match Mongo::connect(env).await {
         Ok(db) => db,

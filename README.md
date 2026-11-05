@@ -17,7 +17,7 @@ Live URL: `https://api.primetiers.net` (custom domain on the `primetiers-api` Wo
 | GET | `/api/gamemodes/:gamemode/tiers?limit=50` | Tier list for one gamemode, newest first. `limit` max 100. |
 | GET | `/api/recent?limit=20` | Latest tests across all gamemodes. `limit` max 100. |
 | POST | `/api/network/report` | Ping results from the website's `/network` page. Saved to the `network_reports` collection. Reports from VPN/WARP/iCloud Private Relay networks are flagged `relay: true`. One report per IP per minute. Never cached. |
-| POST | `/api/network/report/extra` | Adds the hand-run Karachi ping (`khi_ms`) and/or `trace` to a report, using the `token` the first POST returned. Within 1 hour, once. |
+| POST | `/api/network/report/extra` | Adds the player's tracert output (`trace`) to a report, using the `token` the first POST returned. Within 1 hour, once. |
 
 Example batch response:
 
