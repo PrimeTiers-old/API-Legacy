@@ -75,6 +75,17 @@ struct ResultIn {
     /// edge target only.
     #[serde(default)]
     colo: Option<String>,
+    /// Company being tested and where, so results are readable in MongoDB.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+}
+
+/// Short display text from the page: trimmed, 1-64 chars, no control characters.
+fn clean_label(s: Option<String>) -> Option<String> {
+    s.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().count() <= 64 && !s.chars().any(char::is_control))
 }
 
 /// Cloudflare colo codes are 3 uppercase letters (IATA airport codes).
@@ -209,6 +220,12 @@ async fn post_report(mut req: Request, env: &Env, origin: Option<&str>) -> Resul
             let mut d = result_doc(r.id, clean_samples(r.samples));
             if let Some(colo) = clean_colo(r.colo) {
                 d.insert("colo", colo);
+            }
+            if let Some(provider) = clean_label(r.provider) {
+                d.insert("provider", provider);
+            }
+            if let Some(location) = clean_label(r.location) {
+                d.insert("location", location);
             }
             Some(Bson::Document(d))
         })
