@@ -16,6 +16,8 @@ Live URL: `https://api.primetiers.net` (custom domain on the `primetiers-api` Wo
 | GET | `/api/players/:username` | Single player with all tiers. 404 if not found. |
 | GET | `/api/gamemodes/:gamemode/tiers?limit=50` | Tier list for one gamemode, newest first. `limit` max 100. |
 | GET | `/api/recent?limit=20` | Latest tests across all gamemodes. `limit` max 100. |
+| POST | `/api/network/report` | Ping results from the website's `/network` page. Saved to the `network_reports` collection. One report per IP per minute. Never cached. |
+| GET | `/api/network/reports?limit=100` | **Admin.** Needs `Authorization: Bearer <NETWORK_ADMIN_KEY>`. Latest reports plus average ping per target, grouped by country and ASN. `limit` max 1000. |
 
 Example batch response:
 
@@ -116,7 +118,7 @@ Configuration:
 - `MONGODB_URI` — **secret**. The full Atlas connection string.
 - `MONGODB_DB` — plain var in `wrangler.toml`, currently `primetiers`.
 
-Use an Atlas database user with read access. The API is read-only.
+Use an Atlas database user with read access to `primetiers`, plus `insert` on `network_reports`. That collection is the only thing the API writes.
 
 ## Prerequisites
 - Rust (rustup) with the wasm target: `rustup target add wasm32-unknown-unknown`

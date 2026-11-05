@@ -9,8 +9,10 @@
 //!   GET /api/players/:username
 //!   GET /api/gamemodes/:gamemode/tiers?limit=50
 //!   GET /api/recent?limit=20
+//!   POST /api/network/report, GET /api/network/reports (see network.rs)
 
 mod mongo;
+mod network;
 
 use bson::{doc, Bson, Document};
 use mongo::Mongo;
@@ -734,10 +736,18 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         let mut resp = Response::empty()?.with_status(204);
         let h = resp.headers_mut();
         set_cors(h, o)?;
-        h.set("access-control-allow-methods", "GET, OPTIONS")?;
-        h.set("access-control-allow-headers", "content-type")?;
+        h.set("access-control-allow-methods", "GET, POST, OPTIONS")?;
+        h.set("access-control-allow-headers", "content-type, authorization")?;
         h.set("access-control-max-age", "86400")?;
         return Ok(resp);
+    }
+
+    // Network diagnostics: POST + admin GET, never edge-cached.
+    if req.path().starts_with("/api/network/") {
+        if let Some(resp) = network::handle(req, &env, o).await {
+            return resp;
+        }
+        return json_err(404, "not found", o);
     }
 
     if req.method() != Method::Get {

@@ -608,6 +608,27 @@ impl Mongo {
 
         Ok(out)
     }
+
+    /// Inserts one document. Needs a database user with write access to
+    /// `collection`.
+    pub async fn insert_one(&mut self, collection: &str, document: Document) -> Result<()> {
+        let cmd = doc! {
+            "insert": collection,
+            "documents": [document],
+            "$db": self.db.clone(),
+        };
+        let response = command(&mut self.socket, cmd).await?;
+        // A failed write still returns ok:1, with the reason in writeErrors.
+        if let Ok(errors) = response.get_array("writeErrors") {
+            let message = errors
+                .first()
+                .and_then(|e| e.as_document())
+                .and_then(|e| e.get_str("errmsg").ok())
+                .unwrap_or("unknown write error");
+            return Err(Error::RustError(format!("mongo insert failed: {message}")));
+        }
+        Ok(())
+    }
 }
 
 fn docs_from_cursor(cursor: &Document, key: &str) -> Vec<Document> {
