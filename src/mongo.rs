@@ -629,6 +629,30 @@ impl Mongo {
         }
         Ok(())
     }
+
+    /// Updates the first document matching `filter`. Returns how many matched (0 or 1).
+    pub async fn update_one(
+        &mut self,
+        collection: &str,
+        filter: Document,
+        update: Document,
+    ) -> Result<i64> {
+        let cmd = doc! {
+            "update": collection,
+            "updates": [{ "q": filter, "u": update, "multi": false }],
+            "$db": self.db.clone(),
+        };
+        let response = command(&mut self.socket, cmd).await?;
+        if let Ok(errors) = response.get_array("writeErrors") {
+            let message = errors
+                .first()
+                .and_then(|e| e.as_document())
+                .and_then(|e| e.get_str("errmsg").ok())
+                .unwrap_or("unknown write error");
+            return Err(Error::RustError(format!("mongo update failed: {message}")));
+        }
+        Ok(bson_i64(&response, "n").unwrap_or(0))
+    }
 }
 
 fn docs_from_cursor(cursor: &Document, key: &str) -> Vec<Document> {
