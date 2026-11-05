@@ -71,6 +71,15 @@ struct ResultIn {
     /// Round trips in ms, in the order taken. Empty when the test failed.
     #[serde(default)]
     samples: Vec<f64>,
+    /// Cloudflare data center that answered (e.g. "BOM"), for the Cloudflare
+    /// edge target only.
+    #[serde(default)]
+    colo: Option<String>,
+}
+
+/// Cloudflare colo codes are 3 uppercase letters (IATA airport codes).
+fn clean_colo(c: Option<String>) -> Option<String> {
+    c.filter(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase()))
 }
 
 /// Rounds valid samples to 0.1 ms and drops anything out of range.
@@ -197,7 +206,11 @@ async fn post_report(mut req: Request, env: &Env, origin: Option<&str>) -> Resul
                 return None;
             }
             seen.push(r.id.clone());
-            Some(Bson::Document(result_doc(r.id, clean_samples(r.samples))))
+            let mut d = result_doc(r.id, clean_samples(r.samples));
+            if let Some(colo) = clean_colo(r.colo) {
+                d.insert("colo", colo);
+            }
+            Some(Bson::Document(d))
         })
         .collect();
     if results.is_empty() {
