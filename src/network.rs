@@ -32,9 +32,17 @@ const EXTRA_WINDOW_MS: i64 = 60 * 60 * 1000;
 /// route, so they're flagged with `relay: true`.
 const RELAY_ASNS: &[u32] = &[13335, 36183, 54113];
 
-/// Test targets the page may report. Keep in sync with
-/// `Website/src/ui/network.js`.
-const TARGETS: &[&str] = &["vultr-blr", "vultr-del", "vultr-bom", "lightnode-khi"];
+/// Most results one report may hold. Target ids come from the page
+/// (`Website/src/network.js`), e.g. `vultr-bom`, so adding a provider there
+/// needs no API change.
+const MAX_RESULTS: usize = 40;
+
+/// Target ids: 1-32 chars of lowercase letters, digits and `-`.
+fn valid_target(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
 
 #[derive(Deserialize)]
 struct ReportIn {
@@ -146,7 +154,7 @@ async fn post_report(mut req: Request, env: &Env, origin: Option<&str>) -> Resul
         .results
         .into_iter()
         .filter_map(|r| {
-            if !TARGETS.contains(&r.id.as_str()) || seen.contains(&r.id) {
+            if !valid_target(&r.id) || seen.contains(&r.id) || seen.len() >= MAX_RESULTS {
                 return None;
             }
             seen.push(r.id.clone());
