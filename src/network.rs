@@ -105,6 +105,12 @@ fn clean_trace(t: Option<String>) -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
+/// Current time from the Workers runtime. Don't use bson's `DateTime::now()`:
+/// it calls `SystemTime::now()`, which panics on wasm32-unknown-unknown.
+fn now_utc() -> DateTime {
+    DateTime::from_millis(Date::now().as_millis() as i64)
+}
+
 fn opt_str(v: Option<String>) -> Bson {
     v.map(Bson::String).unwrap_or(Bson::Null)
 }
@@ -167,7 +173,7 @@ async fn post_report(mut req: Request, env: &Env, origin: Option<&str>) -> Resul
     let asn = cf.and_then(|c| c.asn());
     let relay = asn.is_some_and(|a| RELAY_ASNS.contains(&a));
     let token = random_token();
-    let now = DateTime::now();
+    let now = now_utc();
 
     let mut db = match Mongo::connect(env).await {
         Ok(db) => db,
@@ -250,7 +256,7 @@ async fn post_extra(mut req: Request, env: &Env, origin: Option<&str>) -> Result
         update.insert("$set", set);
     }
 
-    let now = DateTime::now().timestamp_millis();
+    let now = now_utc().timestamp_millis();
     let filter = doc! {
         "token": &input.token,
         "created_at": { "$gt": DateTime::from_millis(now - EXTRA_WINDOW_MS) },

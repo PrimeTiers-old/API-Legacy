@@ -745,7 +745,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // Network diagnostics: POST + admin GET, never edge-cached.
     if req.path().starts_with("/api/network/") {
         if let Some(resp) = network::handle(req, &env, o).await {
-            return resp;
+            // Keep CORS on failures so the page sees the error, not a CORS block.
+            return resp.or_else(|e| {
+                console_error!("network route error: {e}");
+                json_err(500, "internal error", o)
+            });
         }
         return json_err(404, "not found", o);
     }
