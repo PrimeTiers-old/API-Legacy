@@ -25,7 +25,7 @@ use worker::*;
 
 const COLLECTION: &str = "network_reports";
 const COOLDOWN_MS: i64 = 60_000;
-const MAX_BODY_BYTES: usize = 16 * 1024;
+const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_TRACE_CHARS: usize = 8000;
 /// How long the page may attach extra data to a report it just sent.
 const EXTRA_WINDOW_MS: i64 = 60 * 60 * 1000;
@@ -39,7 +39,7 @@ const RELAY_ASNS: &[u32] = &[13335, 36183, 54113];
 /// Most results one report may hold. Target ids come from the page
 /// (`Website/src/network.js`), e.g. `vultr-bom`, so adding a provider there
 /// needs no API change.
-const MAX_RESULTS: usize = 40;
+const MAX_RESULTS: usize = 100;
 /// Most samples kept per target.
 const MAX_SAMPLES: usize = 50;
 
