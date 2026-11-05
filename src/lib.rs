@@ -9,7 +9,7 @@
 //!   GET /api/players/:username
 //!   GET /api/gamemodes/:gamemode/tiers?limit=50
 //!   GET /api/recent?limit=20
-//!   POST /api/network/report, GET /api/network/reports (see network.rs)
+//!   POST /api/network/report, POST /api/network/report/extra (see network.rs)
 
 mod mongo;
 mod network;

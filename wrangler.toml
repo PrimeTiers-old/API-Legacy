@@ -28,6 +28,5 @@ ALLOWED_ORIGINS = "https://primetiers.net,https://website.eufjbiasdjbfjasdf.work
 
 # Secrets are not stored here. Set them with:
 #   npx wrangler secret put MONGODB_URI
-#   npx wrangler secret put NETWORK_ADMIN_KEY   (any long random string; guards GET /api/network/reports)
 # The Atlas database user needs read access to the primetiers database, plus
-# insert on the network_reports collection (written by POST /api/network/report).
+# insert and update on the network_reports collection (written by POST /api/network/report).
